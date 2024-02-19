@@ -1525,11 +1525,21 @@ class ONNXRUNTIMEAdaptor(Adaptor):
 
         return quantize_config
 
-    def _query_quantizable_ops(self, model):
-        for node in model.graph.node:
+    def _query_quantizable_ops_helper(self, nodes):
+        for node in nodes:
             if node.op_type in self.quantizable_op_types and node not in self.quantizable_ops:
                 self.quantizable_ops.append(node)
+                continue
 
+            for attr in node.attribute:
+                if attr.type == onnx.AttributeProto.GRAPH:
+                    self._query_quantizable_ops_helper(attr.g.node)
+                elif attr.type == onnx.AttributeProto.GRAPHS:
+                    for subgraph in attr.graphs:
+                        self._query_quantizable_ops_helper(subgraph.node)
+
+    def _query_quantizable_ops(self, model):
+        self._query_quantizable_ops_helper(model.graph.node)
         return self.quantizable_ops
 
     def _query_quantizable_op_types(self):
@@ -1863,6 +1873,18 @@ class ONNXRUNTIMEAdaptor(Adaptor):
             predictions.extend(session.run(None, ort_inputs))
         return predictions
 
+def get_quantizable_optypes(nodes):
+    quantizable_optype = set([i.op_type for i in nodes])
+
+    for node in nodes:
+        for attr in node.attribute:
+            if attr.type == onnx.AttributeProto.GRAPH:
+                quantizable_optype.update(get_quantizable_optypes(attr.g.node))
+            elif attr.type == onnx.AttributeProto.GRAPHS:
+                for subgraph in attr.graphs:
+                    quantizable_optype.update(get_quantizable_optypes(subgraph.node))
+
+    return quantizable_optype
 
 @adaptor_registry
 class ONNXRT_WeightOnlyAdaptor(ONNXRUNTIMEAdaptor):
@@ -2090,6 +2112,28 @@ class ONNXRT_WeightOnlyAdaptor(ONNXRUNTIMEAdaptor):
                     last_matmul = (node.name, node.op_type)
             if last_matmul in tune_cfg["op"]:
                 tune_cfg["op"][last_matmul].update(fp32_op_cfg)
+    
+    def get_opwises(self, model, optype_wise, nodes):
+        op_wise = OrderedDict()
+        for node in nodes:
+            if node.op_type in ["MatMul", "Attention"] and model.get_initializer(node.input[1]) is None:
+                op_wise.update(
+                    {(node.name, node.op_type): [{"weight": {"dtype": "fp32"}, "activation": {"dtype": "fp32"}}]}
+                )
+                continue
+
+            if node.op_type in optype_wise:
+                op_wise.update({(node.name, node.op_type): copy.deepcopy(optype_wise[node.op_type])})
+                continue
+
+            for attr in node.attribute:
+                if attr.type == onnx.AttributeProto.GRAPH:
+                    op_wise.update(self.get_opwises(model, optype_wise, attr.g.node))
+                elif attr.type == onnx.AttributeProto.GRAPHS:
+                    for subgraph in attr.graphs:
+                        op_wise.update(self.get_opwises(model, optype_wise, subgraph.node))
+
+        return op_wise
 
     def query_fw_capability(self, model):
         """The function is used to query framework capability.
@@ -2104,9 +2148,8 @@ class ONNXRT_WeightOnlyAdaptor(ONNXRUNTIMEAdaptor):
         # optype_wise and op_wise capability
         self._pre_optimize(model)
 
-        quantizable_optype = set([i.op_type for i in self.pre_optimized_model.nodes()])
+        quantizable_optype = get_quantizable_optypes(self.pre_optimized_model.nodes())
         optype_wise = OrderedDict()
-        op_wise = OrderedDict()
         for query in [self.query_handler, self.query_handler_ext]:
             if query is None:
                 continue
@@ -2144,14 +2187,7 @@ class ONNXRT_WeightOnlyAdaptor(ONNXRUNTIMEAdaptor):
                     elif op_capability not in optype_wise[op]:
                         optype_wise[op].append(op_capability)
 
-        for node in self.pre_optimized_model.nodes():
-            if node.op_type in ["MatMul", "Attention"] and model.get_initializer(node.input[1]) is None:
-                op_wise.update(
-                    {(node.name, node.op_type): [{"weight": {"dtype": "fp32"}, "activation": {"dtype": "fp32"}}]}
-                )
-                continue
-            if node.op_type in optype_wise:
-                op_wise.update({(node.name, node.op_type): copy.deepcopy(optype_wise[node.op_type])})
+        op_wise = self.get_opwises(model, optype_wise, self.pre_optimized_model.nodes())
 
         return {"optypewise": optype_wise, "opwise": op_wise, "recipes_ops": {}, "block_wise": []}
 

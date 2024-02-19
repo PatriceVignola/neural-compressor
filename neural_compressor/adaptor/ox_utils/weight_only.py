@@ -22,6 +22,8 @@ import math
 import os
 import struct
 import sys
+import torch
+import gc
 
 import numpy as np
 import onnx
@@ -406,6 +408,7 @@ def rtn_quantize(
     model.add_nodes(new_nodes)
     model.remove_nodes(remove_nodes)
     model.topological_sort()
+
     return model
 
 
@@ -438,7 +441,6 @@ def apply_awq_scale(model, weight_config, absorb_pairs, output_dicts, num_bits, 
         inp_scale = np.mean(np.reshape(np.abs(inp), (-1, inp[0].shape[-1])), axis=0)
         dtype = None
         weight = []
-        org_out = []
         for node in nodes:
             if node.name in weight_config and weight_config.get(node.name, "fp32") != "fp32":
                 num_bits = weight_config[node.name]["bits"]
@@ -452,9 +454,11 @@ def apply_awq_scale(model, weight_config, absorb_pairs, output_dicts, num_bits, 
         best_scale = None
         n_grid = 20
 
+        inp = torch.tensor(inp, device="cuda")
+
         for ratio in range(n_grid):
             ratio = ratio * 1 / n_grid
-            loss = 0
+            loss = torch.tensor(0, dtype=torch.float32)
             for node in nodes:
                 if weight_config.get(node.name, {}) == "fp32":
                     continue
@@ -463,7 +467,9 @@ def apply_awq_scale(model, weight_config, absorb_pairs, output_dicts, num_bits, 
                 if len(weight.shape) != 2:
                     continue
 
-                org_out = np.matmul(inp, weight)
+                print(f"Performing matmul on {node.name} for ratio {ratio}...")
+                org_out = torch.matmul(inp, torch.tensor(weight, device="cuda"))
+                print("Done!")
                 org_w_shape = weight.shape
                 group_size = group_size if group_size != -1 else org_w_shape[0]
 
@@ -485,9 +491,18 @@ def apply_awq_scale(model, weight_config, absorb_pairs, output_dicts, num_bits, 
                     q_weight = qdq_tensor(weight, num_bits, group_size, scheme, "int") / np.expand_dims(scales, axis=-1)
 
                 q_weight = np.reshape(q_weight, (org_w_shape[1], -1))[:, : org_w_shape[0]]
-                out = np.matmul(inp, q_weight.T)
-                loss += np.mean(np.power((org_out - out), 2))
+                q_weight = torch.tensor(q_weight, device="cuda", dtype=torch.float16)
+                out = torch.matmul(inp, q_weight.T)
+                del q_weight
+                gc.collect()
 
+                loss += torch.mean(torch.pow((org_out.to(torch.float32) - out.to(torch.float32)), 2)).cpu().item()
+
+                del org_out
+                del out
+                gc.collect()
+
+            print(f"loss: {loss} - best_error: {best_error}")
             is_best = loss < best_error
             if is_best:
                 best_error = loss
@@ -602,6 +617,7 @@ def apply_awq_clip(model, weight_config, absorb_pairs, output_dicts, num_bits, g
             continue
 
         inp = np.concatenate(output_dicts[nodes[0].input[0]], axis=0)
+        inp = torch.tensor(inp, device="cuda")
 
         for node in nodes:
             if node.name in weight_config:
@@ -612,7 +628,7 @@ def apply_awq_clip(model, weight_config, absorb_pairs, output_dicts, num_bits, g
             org_weight = numpy_helper.to_array(model.get_initializer(node.input[1]), base_dir=base_dir)
             org_w_shape = org_weight.shape  # ic, oc
             group_size = group_size if group_size != -1 else org_w_shape[0]
-            org_out = np.matmul(inp, org_weight)  # n_token, oc
+            org_out = torch.matmul(inp, torch.tensor(org_weight, device="cuda"))  # n_token, oc
 
             k_blocks = (org_w_shape[0] - 1) // group_size + 1
             org_weight = pad_tensor(org_weight, group_size, k_blocks)
@@ -633,13 +649,25 @@ def apply_awq_clip(model, weight_config, absorb_pairs, output_dicts, num_bits, g
                 else:
                     weight = qdq_tensor(weight, num_bits, group_size, scheme, "int", ratios.get(node.input[1], 1))
                 weight = np.reshape(weight, (org_w_shape[1], -1))[:, : org_w_shape[0]]
-                cur_out = np.matmul(inp, weight.T)
-                loss = np.mean(np.power((org_out - cur_out), 2))
+                weight = torch.tensor(weight, device="cuda", dtype=torch.float16)
+                cur_out = torch.matmul(inp, weight.T)
+
+                del weight
+                gc.collect()
+
+                loss = torch.mean(torch.pow((org_out.to(torch.float32) - cur_out.to(torch.float32)), 2)).cpu().item()
+                del cur_out
+                gc.collect()
+
                 is_best = loss < best_error
                 if is_best:
                     best_error = loss
                     best_ratio = ratio
             ratios[node.input[1]] = best_ratio
+
+            del org_out
+            gc.collect()
+
     return ratios
 
 
@@ -700,6 +728,27 @@ def prepare_inputs(model, n_samples, dataloader, providers):
     return inputs, so
 
 
+def get_output_names(weight_config, nodes):
+    output_names = []
+    for node in nodes:
+        if (
+            node.op_type in ["MatMul"]
+            and weight_config.get(node.name, {}) != "fp32"
+            and weight_config.get(node.name, {}).get("algorithm", "AWQ") == "AWQ"
+        ):
+            output_names.append(node.input[0])
+            continue
+
+        for attr in node.attribute:
+            if attr.type == onnx.AttributeProto.GRAPH:
+                output_names.extend(get_output_names(weight_config, attr.g.node))
+            elif attr.type == onnx.AttributeProto.GRAPHS:
+                for subgraph in attr.graphs:
+                    output_names.extend(get_output_names(weight_config, subgraph.node))
+
+    return output_names
+
+
 def awq_quantize(
     model,
     dataloader,
@@ -754,14 +803,7 @@ def awq_quantize(
         org_output = copy.deepcopy(model.model.graph.output)
         model.remove_tensors_from_outputs([i.name for i in org_output])
 
-        output_names = []
-        for node in model.nodes():
-            if (
-                node.op_type in ["MatMul"]
-                and weight_config.get(node.name, {}) != "fp32"
-                and weight_config.get(node.name, {}).get("algorithm", "AWQ") == "AWQ"
-            ):
-                output_names.append(node.input[0])
+        output_names = get_output_names(weight_config, model.nodes())
         output_names = list(set(output_names))
         model.add_tensors_to_outputs(output_names)
         if model.is_large_model:
@@ -773,13 +815,8 @@ def awq_quantize(
                 convert_attribute=False,
             )
 
-        session = (
-            ort.InferenceSession(model.model.SerializeToString(), so, providers=providers)
-            if not model.is_large_model
-            else ort.InferenceSession(model.model_path + "_augment.onnx", so, providers=providers)
-        )
-
-        for input_name in output_names:
+        for idx, input_name in enumerate(output_names):
+            simple_progress_bar(len(output_names), idx + 1)
             parent = model.output_name_to_node[input_name]
             dump_pairs = {parent.name: []}
 
@@ -795,12 +832,24 @@ def awq_quantize(
             if len(dump_pairs[parent.name]) == 0:
                 continue
 
+            session = (
+                ort.InferenceSession(model.model.SerializeToString(), so, providers=providers)
+                if not model.is_large_model
+                else ort.InferenceSession(model.model_path + "_augment.onnx", so, providers=providers)
+            )
+
             output_dicts = {}
-            for inp in inputs:
+            for idx, inp in enumerate(inputs):
+                print(f"Running model for sample {idx}")
                 output = session.run([input_name], inp)
                 output_dicts.setdefault(input_name, []).append(output)
 
-            if enable_auto_scale:
+            del session
+            gc.collect()
+
+            # if enable_auto_scale:
+            if enable_auto_scale and input_name:
+                print("Applying AWQ scale")
                 model, output_dicts = apply_awq_scale(
                     model,
                     weight_config,
@@ -810,7 +859,9 @@ def awq_quantize(
                     group_size,
                     scheme,
                 )
-            if enable_mse_search:
+            # if enable_mse_search:
+            if enable_mse_search and input_name:
+                print("Applying AWQ clip")
                 ratios = apply_awq_clip(
                     model,
                     weight_config,
@@ -822,11 +873,18 @@ def awq_quantize(
                 )
             del output_dicts
             del dump_pairs
+            torch.cuda.empty_cache()
             full_ratio.update(ratios)
 
         model.remove_tensors_from_outputs(output_names)
         model.model.graph.output.MergeFrom(org_output)
     model = rtn_quantize(model, weight_config, num_bits, group_size, scheme, full_ratio, accuracy_level, providers)
+
+    # reload external data to prevent external data file path errors
+    if model.is_large_model:
+        from onnx.external_data_helper import load_external_data_for_model
+        load_external_data_for_model(model.model, os.path.split(model.model_path)[0])
+
     return model
 
 
@@ -1081,16 +1139,19 @@ def gptq_quantize(
         if len(weights) == 0:
             continue
 
-        Hs = [np.zeros((i.shape[0], i.shape[0])) for i in weights]
+        Hs = [torch.zeros((i.shape[0], i.shape[0]), device="cuda") for i in weights]
         nsamples = 0
         for data in inputs:
             inp = session.run([input_name], data)[0]
+            inp = torch.tensor(inp, device="cuda")
             tmp = inp.shape[0]
-            inp = np.reshape(inp, (-1, inp.shape[-1]))
+            inp = torch.reshape(inp, (-1, inp.shape[-1]))
             Hs = [i * (nsamples / (nsamples + tmp)) for i in Hs]
             nsamples += tmp
             inp = np.sqrt(2 / nsamples) * inp
-            Hs = [i + np.matmul(inp.T, inp) for i in Hs]
+            Hs = [i + torch.matmul(inp.T, inp) for i in Hs]
+
+        Hs = [i.cpu().numpy() for i in Hs]
 
         for (
             node,
