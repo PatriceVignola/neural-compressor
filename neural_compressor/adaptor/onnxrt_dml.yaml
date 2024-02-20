@@ -17,6 +17,20 @@
 -
   version:
     name: '1.13.1'
+  weight_only_integer: &cap_weight_only {
+    'MatMul': &cap_weight_only_matmul {
+        'weight': {
+                    'dtype': ['int'], # no need to care uint
+                    'bits': [4],
+                    'group_size': [32, -1, 1, 16, 64, 128, 256, 512, 1024], # [1-inf]
+                    'scheme': ['sym', 'asym'], # sym, no ZP
+                    'algorithm': ['RTN', 'AWQ', 'GPTQ']
+        },
+        'activation': {
+                    'dtype': ['fp32']
+        }
+    },
+  }
   int8: &ref_1_13 {
     'static': &ref_1_13_static {
       'Conv': &default_static_qlinear_qdq {
